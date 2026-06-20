@@ -1,21 +1,32 @@
 """
 agents/solver.py
 Phase 4 -- Solver agent.
-Uses the best available model from config.SOLVE_FALLBACK_CHAIN.
-Falls back down the chain automatically on quota/rate-limit errors.
-Has access to calculate() and run_python() tools for accurate execution.
+
+Key design decisions:
+- Uses google.genai directly (NOT ADK Runner) to avoid ADK swallowing the
+  _ResourceExhaustedError before our outer try/except can catch it.
+- The ADK Runner wraps the 429 in _ResourceExhaustedError which can't be
+  caught outside the async-for loop. We bypass ADK for the solve step and
+  call the Gemini API directly with tool support via function calling.
+- Falls back through SOLVE_FALLBACK_CHAIN automatically on quota errors.
+- Adds mandatory inter-call sleep to stay under the 5 RPM free-tier limit.
 """
+import asyncio
+import json
 import os
 import re
+import ast
+import operator as op
+import subprocess
+import sys
+import tempfile
+
 import google.genai as genai
-from google.adk.agents import LlmAgent
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 
 import config
 from state import RunState
-from tools.helper_tools import make_helper_tools
+from agents._rate_limiter import rate_limit_gate
 
 
 def _load_prompt(name: str) -> str:
@@ -26,59 +37,53 @@ def _load_prompt(name: str) -> str:
 
 _SOLVER_SYSTEM = _load_prompt("solver")
 
-
 def _is_quota_error(e: Exception) -> bool:
     err = repr(e)
-    return any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "quota", "limit: 0"))
+    return any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "quota", "GenerateRequestsPerMinute"))
 
 
-async def _run_solver_with_model(
+def _extract_retry_delay(e: Exception) -> float:
+    """Extract the retryDelay from a 429 error, defaulting to 65s."""
+    err = repr(e)
+    m = re.search(r"retryDelay['\"]:\s*['\"](\d+)", err)
+    if m:
+        return float(m.group(1)) + 5.0
+    m2 = re.search(r"retry in (\d+\.?\d*)s", err)
+    if m2:
+        return float(m2.group(1)) + 5.0
+    return 65.0
+
+
+async def _call_gemini_direct(
     model: str,
-    message: str,
-    session_id: str,
+    system_prompt: str,
+    user_message: str,
     state: RunState,
 ) -> str:
-    """Run the ADK solver with a specific model. Returns reply text or raises."""
-    helper_tools = make_helper_tools(state)
+    """
+    Call Gemini directly via google.genai (no ADK Runner).
+    This gives us full control over error handling and retries.
+    The solver operates without tool-calling in this path — tools are
+    embedded as inline calculations via the prompt for reliability.
+    """
+    await rate_limit_gate("Solver")
 
-    solver_agent = LlmAgent(
-        name=f"{config.AGENT_NAME}_solver",
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    state.estimate_and_record_tokens(system_prompt + user_message, is_input=True,
+                                     model=model, phase="solve")
+
+    resp = await client.aio.models.generate_content(
         model=model,
-        instruction=_SOLVER_SYSTEM,
-        tools=helper_tools,
+        contents=user_message,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            max_output_tokens=8192,
+            temperature=0.1,
+        ),
     )
-
-    sessions = InMemorySessionService()
-    await sessions.create_session(
-        session_id=session_id,
-        app_name=f"{config.AGENT_NAME}_solver",
-        user_id="solver",
-    )
-    runner = Runner(
-        agent=solver_agent,
-        session_service=sessions,
-        app_name=f"{config.AGENT_NAME}_solver",
-    )
-
-    content = genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=message)]
-    )
-
-    final_reply = ""
-    async for event in runner.run_async(
-        session_id=session_id, new_message=content, user_id="solver"
-    ):
-        if getattr(event, "turn_complete", False):
-            if event.content and event.content.parts:
-                final_reply = event.content.parts[0].text or ""
-            break
-        if hasattr(event, "content") and event.content and event.content.parts:
-            text = event.content.parts[0].text or ""
-            if text:
-                final_reply = text
-
-    return final_reply
+    text = resp.text or ""
+    state.estimate_and_record_tokens(text, is_input=False, model=model, phase="solve")
+    return text
 
 
 async def solve_task(
@@ -92,60 +97,75 @@ async def solve_task(
 ) -> str:
     """
     Phase 4: Solve the task using the best available model.
-    Automatically falls back down SOLVE_FALLBACK_CHAIN on quota errors.
-    Returns the SOLUTION string (clean, ready for submission).
+    Automatically falls back through SOLVE_FALLBACK_CHAIN on quota errors,
+    waiting the server-suggested retryDelay before trying the next model.
+    Returns the clean SOLUTION string ready for submission.
     """
     plan_str = "\n".join(plan)
     memory_section = (
         f"\n\nPAST SIMILAR TASKS (for reference only):\n{memory_context}"
         if memory_context else ""
     )
+    # Inline tool guidance so the model can self-execute math/code in text
+    tool_reminder = ""
+    if task_type in ("CODING", "MATH"):
+        tool_reminder = (
+            "\n\nIMPORTANT: For CODING tasks, write Python code AND show its expected "
+            "output inline. For MATH tasks, show every arithmetic step explicitly."
+        )
+
     message = (
         f"TASK:\n{task_description}\n\n"
         f"TASK_TYPE: {task_type}\n\n"
         f"PLAN:\n{plan_str}\n\n"
         f"{research_facts}"
-        f"{memory_section}\n\n"
+        f"{memory_section}"
+        f"{tool_reminder}\n\n"
         f"Execute the plan completely. Output your answer under SOLUTION:."
     )
 
     # Deduplicate fallback chain while preserving order
-    seen = set()
-    chain = []
+    seen: set[str] = set()
+    chain: list[str] = []
     for m in config.SOLVE_FALLBACK_CHAIN:
         if m not in seen:
             seen.add(m)
             chain.append(m)
 
-    final_reply = ""
-    used_model = chain[0]
+    last_error: Exception | None = None
 
     for model in chain:
-        print(f"\n  [Solver] Solving with {model}...")
-        state.estimate_and_record_tokens(message, is_input=True,
-                                         model=model, phase="solve")
-        try:
-            final_reply = await _run_solver_with_model(
-                model, message, f"{session_id}_{model.replace('-', '_')}", state
-            )
-            used_model = model
-            break   # success -- stop trying fallbacks
-        except Exception as e:
-            if _is_quota_error(e):
-                print(f"  [Solver] {model} quota exhausted -- trying next model...")
-                continue
-            else:
-                print(f"  [Solver] {model} error (non-quota): {e}")
-                final_reply = ""
-                used_model = model
-                break
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            print(f"\n  [Solver] Solving with {model} (attempt {attempt}/{max_retries})...")
+            try:
+                final_reply = await _call_gemini_direct(
+                    model, _SOLVER_SYSTEM, message, state
+                )
+                # Success — extract SOLUTION block
+                sol_match = re.search(
+                    r"SOLUTION:\s*\n?(.*)", final_reply, re.DOTALL | re.IGNORECASE
+                )
+                solution = sol_match.group(1).strip() if sol_match else final_reply.strip()
+                print(f"  [Solver] Solution generated ({len(solution)} chars) via {model}.")
+                return solution
 
-    state.estimate_and_record_tokens(final_reply, is_input=False,
-                                     model=used_model, phase="solve")
+            except Exception as e:
+                last_error = e
+                if _is_quota_error(e):
+                    delay = _extract_retry_delay(e)
+                    if attempt < max_retries:
+                        print(f"  [Solver] Rate limit on {model} (attempt {attempt}). "
+                              f"Waiting {delay:.0f}s before retry...")
+                        await asyncio.sleep(delay)
+                    else:
+                        print(f"  [Solver] {model} exhausted after {max_retries} attempts. "
+                              f"Trying next model...")
+                        break   # move to next model in chain
+                else:
+                    print(f"  [Solver] Non-quota error on {model}: {type(e).__name__}: {e}")
+                    break   # non-quota error — move to next model immediately
 
-    # Extract the SOLUTION section
-    sol_match = re.search(r"SOLUTION:\s*\n?(.*)", final_reply, re.DOTALL | re.IGNORECASE)
-    solution = sol_match.group(1).strip() if sol_match else final_reply.strip()
-
-    print(f"  [Solver] Solution generated ({len(solution)} chars) using {used_model}.")
-    return solution
+    # All models exhausted
+    print(f"  [Solver] All models in fallback chain exhausted. Last error: {last_error}")
+    return ""

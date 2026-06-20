@@ -31,12 +31,12 @@ MODEL_SOLVE    = os.getenv("MODEL_SOLVE",    "gemini-2.5-flash")
 # Fallback / default
 MODEL          = os.getenv("MODEL",          "gemini-2.5-flash")
 
-# Ordered fallback chain for the solver — tried left-to-right on quota errors
+# Ordered fallback chain for the solver -- tried left-to-right on quota errors
+# NOTE: gemini-2.0-flash and flash-lite daily quotas exhaust quickly on free tier.
+# Only list models with confirmed available quota.
 SOLVE_FALLBACK_CHAIN = [
-    MODEL_SOLVE,
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
+    MODEL_SOLVE,           # gemini-2.5-flash (primary)
+    "gemini-2.5-flash-lite",  # lighter fallback (20 RPD free tier)
 ]
 
 # -- Loop Control --------------------------------------------------------------

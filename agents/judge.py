@@ -9,6 +9,7 @@ import google.genai as genai
 
 import config
 from state import RunState
+from agents._rate_limiter import rate_limit_gate
 
 
 def _load_prompt(name: str) -> str:
@@ -47,6 +48,7 @@ async def judge_solution(
     state.estimate_and_record_tokens(_JUDGE_SYSTEM + prompt, is_input=True,
                                      model=config.MODEL_JUDGE, phase="judge")
     try:
+        await rate_limit_gate("Judge")
         resp = await client.aio.models.generate_content(
             model=config.MODEL_JUDGE,
             contents=prompt,

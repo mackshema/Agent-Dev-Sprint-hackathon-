@@ -9,6 +9,7 @@ import os
 import google.genai as genai
 import config
 from state import RunState
+from agents._rate_limiter import rate_limit_gate
 
 
 def _load_prompt(name: str) -> str:
@@ -47,6 +48,7 @@ async def plan_task(task_description: str, state: RunState) -> PlanResult:
     state.estimate_and_record_tokens(_PLANNER_SYSTEM + prompt, is_input=True,
                                      model=config.MODEL_CLASSIFY, phase="classify")
     try:
+        await rate_limit_gate("Planner")
         resp = await client.aio.models.generate_content(
             model=config.MODEL_CLASSIFY,
             contents=prompt,

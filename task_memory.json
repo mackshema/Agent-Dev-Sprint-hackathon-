@@ -1,0 +1,11 @@
+[
+  {
+    "timestamp": "2026-06-20T09:12:37.415724+00:00",
+    "task_id": "basic-log-extraction",
+    "title": "Basic Log Extraction",
+    "task_type": "ANALYSIS",
+    "solution": "10.0.0.42",
+    "score": 75,
+    "feedback": ""
+  }
+]
