@@ -26,10 +26,18 @@ MODEL_CLASSIFY = os.getenv("MODEL_CLASSIFY", "gemini-2.5-flash-lite")
 MODEL_PLAN     = os.getenv("MODEL_PLAN",     "gemini-2.5-flash")
 MODEL_CRITIQUE = os.getenv("MODEL_CRITIQUE", "gemini-2.5-flash")
 MODEL_JUDGE    = os.getenv("MODEL_JUDGE",    "gemini-2.5-flash")
-# Phase 4 (Solve) — most capable model
-MODEL_SOLVE    = os.getenv("MODEL_SOLVE",    "gemini-2.5-pro")
+# Phase 4 (Solve) — best available model (pro requires paid tier; flash works on free)
+MODEL_SOLVE    = os.getenv("MODEL_SOLVE",    "gemini-2.5-flash")
 # Fallback / default
 MODEL          = os.getenv("MODEL",          "gemini-2.5-flash")
+
+# Ordered fallback chain for the solver — tried left-to-right on quota errors
+SOLVE_FALLBACK_CHAIN = [
+    MODEL_SOLVE,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+]
 
 # -- Loop Control --------------------------------------------------------------
 try:

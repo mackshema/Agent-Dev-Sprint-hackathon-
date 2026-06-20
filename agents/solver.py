@@ -1,7 +1,8 @@
 """
 agents/solver.py
-Phase 4 — Solver agent.
-Uses gemini-2.5-pro (most capable) to execute the plan and produce a solution.
+Phase 4 -- Solver agent.
+Uses the best available model from config.SOLVE_FALLBACK_CHAIN.
+Falls back down the chain automatically on quota/rate-limit errors.
 Has access to calculate() and run_python() tools for accurate execution.
 """
 import os
@@ -26,27 +27,23 @@ def _load_prompt(name: str) -> str:
 _SOLVER_SYSTEM = _load_prompt("solver")
 
 
-async def solve_task(
-    task_description: str,
-    task_type: str,
-    plan: list[str],
-    research_facts: str,
-    memory_context: str,
-    state: RunState,
-    session_id: str,
-) -> str:
-    """
-    Phase 4: Use gemini-2.5-pro to solve the task with tool access.
-    Returns the SOLUTION string (clean, ready for submission).
-    """
-    print(f"\n  [Solver] Solving with {config.MODEL_SOLVE}...")
+def _is_quota_error(e: Exception) -> bool:
+    err = repr(e)
+    return any(k in err for k in ("429", "RESOURCE_EXHAUSTED", "quota", "limit: 0"))
 
+
+async def _run_solver_with_model(
+    model: str,
+    message: str,
+    session_id: str,
+    state: RunState,
+) -> str:
+    """Run the ADK solver with a specific model. Returns reply text or raises."""
     helper_tools = make_helper_tools(state)
 
-    # Build the solver agent with tool access
     solver_agent = LlmAgent(
         name=f"{config.AGENT_NAME}_solver",
-        model=config.MODEL_SOLVE,
+        model=model,
         instruction=_SOLVER_SYSTEM,
         tools=helper_tools,
     )
@@ -63,9 +60,46 @@ async def solve_task(
         app_name=f"{config.AGENT_NAME}_solver",
     )
 
-    # Compose the full input message for the solver
+    content = genai_types.Content(
+        role="user",
+        parts=[genai_types.Part(text=message)]
+    )
+
+    final_reply = ""
+    async for event in runner.run_async(
+        session_id=session_id, new_message=content, user_id="solver"
+    ):
+        if getattr(event, "turn_complete", False):
+            if event.content and event.content.parts:
+                final_reply = event.content.parts[0].text or ""
+            break
+        if hasattr(event, "content") and event.content and event.content.parts:
+            text = event.content.parts[0].text or ""
+            if text:
+                final_reply = text
+
+    return final_reply
+
+
+async def solve_task(
+    task_description: str,
+    task_type: str,
+    plan: list[str],
+    research_facts: str,
+    memory_context: str,
+    state: RunState,
+    session_id: str,
+) -> str:
+    """
+    Phase 4: Solve the task using the best available model.
+    Automatically falls back down SOLVE_FALLBACK_CHAIN on quota errors.
+    Returns the SOLUTION string (clean, ready for submission).
+    """
     plan_str = "\n".join(plan)
-    memory_section = f"\n\nPAST SIMILAR TASKS (for reference only):\n{memory_context}" if memory_context else ""
+    memory_section = (
+        f"\n\nPAST SIMILAR TASKS (for reference only):\n{memory_context}"
+        if memory_context else ""
+    )
     message = (
         f"TASK:\n{task_description}\n\n"
         f"TASK_TYPE: {task_type}\n\n"
@@ -75,41 +109,43 @@ async def solve_task(
         f"Execute the plan completely. Output your answer under SOLUTION:."
     )
 
-    state.estimate_and_record_tokens(message, is_input=True,
-                                     model=config.MODEL_SOLVE, phase="solve")
-
-    content = genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=message)]
-    )
+    # Deduplicate fallback chain while preserving order
+    seen = set()
+    chain = []
+    for m in config.SOLVE_FALLBACK_CHAIN:
+        if m not in seen:
+            seen.add(m)
+            chain.append(m)
 
     final_reply = ""
-    try:
-        async for event in runner.run_async(
-            session_id=session_id, new_message=content, user_id="solver"
-        ):
-            if getattr(event, "turn_complete", False):
-                if event.content and event.content.parts:
-                    final_reply = event.content.parts[0].text or ""
+    used_model = chain[0]
+
+    for model in chain:
+        print(f"\n  [Solver] Solving with {model}...")
+        state.estimate_and_record_tokens(message, is_input=True,
+                                         model=model, phase="solve")
+        try:
+            final_reply = await _run_solver_with_model(
+                model, message, f"{session_id}_{model.replace('-', '_')}", state
+            )
+            used_model = model
+            break   # success -- stop trying fallbacks
+        except Exception as e:
+            if _is_quota_error(e):
+                print(f"  [Solver] {model} quota exhausted -- trying next model...")
+                continue
+            else:
+                print(f"  [Solver] {model} error (non-quota): {e}")
+                final_reply = ""
+                used_model = model
                 break
-            # Capture any intermediate text in case turn_complete isn't fired
-            if hasattr(event, "content") and event.content and event.content.parts:
-                text = event.content.parts[0].text or ""
-                if text:
-                    final_reply = text
-    except Exception as e:
-        print(f"  [Solver] Runner error: {e}")
-        final_reply = ""
 
     state.estimate_and_record_tokens(final_reply, is_input=False,
-                                     model=config.MODEL_SOLVE, phase="solve")
+                                     model=used_model, phase="solve")
 
     # Extract the SOLUTION section
     sol_match = re.search(r"SOLUTION:\s*\n?(.*)", final_reply, re.DOTALL | re.IGNORECASE)
-    if sol_match:
-        solution = sol_match.group(1).strip()
-    else:
-        solution = final_reply.strip()
+    solution = sol_match.group(1).strip() if sol_match else final_reply.strip()
 
-    print(f"  [Solver] Solution generated ({len(solution)} chars).")
+    print(f"  [Solver] Solution generated ({len(solution)} chars) using {used_model}.")
     return solution
